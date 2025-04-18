@@ -469,9 +469,7 @@ class FSDPSFTTrainer(object):
             return 0
 
         # load from hdfs
-        if self.config.trainer.default_hdfs_dir is not None:
-            raise NotImplementedError('load from hdfs is not implemented yet')
-        else:
+        if self.config.trainer.default_local_dir is not None:
             checkpoint_folder = self.config.trainer.default_local_dir
             if not os.path.isabs(checkpoint_folder):
                 working_dir = os.getcwd()
