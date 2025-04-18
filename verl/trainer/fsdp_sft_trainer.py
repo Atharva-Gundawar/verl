@@ -42,6 +42,7 @@ from verl.utils.dataset import SFTDataset
 from verl.utils.dataset.multiturn_sft_dataset import MultiTurnSFTDataset
 from verl.utils.fs import copy_to_local
 from verl.utils.tracking import Tracking
+from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path
 from verl.utils.ulysses import get_ulysses_sequence_parallel_world_size, set_ulysses_sequence_parallel_group
 from torch.distributed.device_mesh import DeviceMesh
 
@@ -451,10 +452,72 @@ class FSDPSFTTrainer(object):
             os.makedirs(path, exist_ok=True)
             self.model.save_pretrained(path, state_dict=state_dict)
             self.tokenizer.save_pretrained(path)
+            
+            # Save optimizer state
+            torch.save(self.optimizer.state_dict(), os.path.join(path, 'optimizer.pt'))
+            
+            # Save scheduler state
+            torch.save(self.lr_scheduler.state_dict(), os.path.join(path, 'scheduler.pt'))
+            
             if self.config.trainer.default_hdfs_dir:
                 hdfs_io.makedirs(self.config.trainer.default_hdfs_dir, exist_ok=True)
                 hdfs_io.copy(src=path, dst=self.config.trainer.default_hdfs_dir, dirs_exist_ok=True)
         torch.distributed.barrier()
+
+    def _load_checkpoint(self):
+        if self.config.trainer.resume_mode == 'disable':
+            return 0
+
+        # load from hdfs
+        if self.config.trainer.default_hdfs_dir is not None:
+            raise NotImplementedError('load from hdfs is not implemented yet')
+        else:
+            checkpoint_folder = self.config.trainer.default_local_dir
+            if not os.path.isabs(checkpoint_folder):
+                working_dir = os.getcwd()
+                checkpoint_folder = os.path.join(working_dir, checkpoint_folder)
+            global_step_folder = find_latest_ckpt_path(checkpoint_folder)  # None if no latest
+
+        # find global_step_folder
+        if self.config.trainer.resume_mode == 'auto':
+            if global_step_folder is None:
+                print('Training from scratch')
+                return 0
+        else:
+            if self.config.trainer.resume_mode == "resume_path":
+                assert isinstance(self.config.trainer.resume_from_path, str), "resume ckpt must be str type"
+                assert 'global_step_' in self.config.trainer.resume_from_path, "resume ckpt must specify the global_steps"
+                global_step_folder = self.config.trainer.resume_from_path
+                if not os.path.isabs(global_step_folder):
+                    working_dir = os.getcwd()
+                    global_step_folder = os.path.join(working_dir, global_step_folder)
+        print(f'Load from checkpoint folder: {global_step_folder}')
+        # set global step
+        global_step = int(global_step_folder.split('global_step_')[-1])
+
+        print(f'Setting global step to {global_step}')
+        print(f'Resuming from {global_step_folder}')
+
+        # Load model state dict
+        from torch.distributed.fsdp import FullStateDictConfig, StateDictType
+        cfg = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
+        with FSDP.state_dict_type(self.fsdp_model, StateDictType.FULL_STATE_DICT, cfg):
+            state_dict = torch.load(os.path.join(global_step_folder, 'pytorch_model.bin'))
+            self.fsdp_model.load_state_dict(state_dict)
+
+        # Load optimizer state if exists
+        optimizer_path = os.path.join(global_step_folder, 'optimizer.pt')
+        if os.path.exists(optimizer_path):
+            optimizer_state = torch.load(optimizer_path)
+            self.optimizer.load_state_dict(optimizer_state)
+
+        # Load scheduler state if exists
+        scheduler_path = os.path.join(global_step_folder, 'scheduler.pt')
+        if os.path.exists(scheduler_path):
+            scheduler_state = torch.load(scheduler_path)
+            self.lr_scheduler.load_state_dict(scheduler_state)
+
+        return global_step
 
     def fit(self):
         rank = self.device_mesh.get_rank()
@@ -465,7 +528,9 @@ class FSDPSFTTrainer(object):
                                 experiment_name=self.config.trainer.experiment_name,
                                 default_backend=self.config.trainer.logger)
 
-        global_step = 0
+        # Load checkpoint before starting training
+        global_step = self._load_checkpoint()
+
         # compute the total training steps.
         # the total training steps in SFT is mainly for early exit
         total_training_steps = len(self.train_dataloader) * self.config.trainer.total_epochs
@@ -488,6 +553,10 @@ class FSDPSFTTrainer(object):
                 metric = self.training_step(data)
                 if rank == 0:
                     tracking.log(data=metric, step=global_step)
+
+                # Save checkpoint at regular intervals if save_freq is set
+                if hasattr(self.config.trainer, 'save_freq') and self.config.trainer.save_freq > 0 and global_step % self.config.trainer.save_freq == 0:
+                    self.save_checkpoint(step=global_step)
 
                 # for early exit validation
                 if global_step >= self.total_training_steps:
@@ -519,8 +588,9 @@ class FSDPSFTTrainer(object):
                 tracking.log(data=metric, step=global_step)
             torch.distributed.barrier()
 
-            # save checkpoint
-            self.save_checkpoint(step=global_step)
+            # save checkpoint at end of epoch if save_freq is not set or if it's not a multiple of save_freq
+            if not hasattr(self.config.trainer, 'save_freq') or self.config.trainer.save_freq <= 0 or global_step % self.config.trainer.save_freq != 0:
+                self.save_checkpoint(step=global_step)
 
 
 from verl.trainer.fsdp_sft_trainer import FSDPSFTTrainer
