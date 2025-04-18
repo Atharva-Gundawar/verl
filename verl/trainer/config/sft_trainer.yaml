@@ -46,12 +46,14 @@ use_remove_padding: False
 trainer:
   default_local_dir: /tmp/sft_model
   default_hdfs_dir: hdfs://tmp/experiments/gsm8k/gemma-1.1-7b-it/ # change the hdfs path here
-  resume_path: null
+  resume_mode: auto  # or 'resume_path' or 'disable'
+  resume_from_path: null  # set this if using 'resume_path' mode
+  save_freq: 1000  # save checkpoint every 1000 steps
   project_name: gsm8k-sft
   experiment_name: test
   total_epochs: 4
   total_training_steps: null
   logger: ['console']
   seed: 1
-  save_freq: 1000
+  
 
