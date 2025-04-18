@@ -116,11 +116,14 @@ class SFTDataset(Dataset):
         prompt = self.prompts[item]
         response = self.responses[item]
 
-        # apply chat template
-        prompt_chat = [{'role': 'user', 'content': prompt}]
-
-        # string
-        prompt_chat_str = tokenizer.apply_chat_template(prompt_chat, add_generation_prompt=True, tokenize=False)
+        # apply chat template if available, otherwise use default format
+        try:
+            prompt_chat = [{'role': 'user', 'content': prompt}]
+            prompt_chat_str = tokenizer.apply_chat_template(prompt_chat, add_generation_prompt=True, tokenize=False)
+        except ValueError:
+            # Fallback to simple format if chat template is not available
+            prompt_chat_str = f"User: {prompt}\nAssistant:"
+            
         response_chat_str = response + tokenizer.eos_token
 
         # tokenize
