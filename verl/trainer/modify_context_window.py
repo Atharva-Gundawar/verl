@@ -8,7 +8,8 @@ def modify_context_window(model_path, output_path, new_context_window=64000):
 
     # Extend context window
     config.max_position_embeddings = new_context_window
-
+    # Set rope-scaling 
+    config.rope_scaling = {"type":"dynamic","factor":32.0}
     # Load model with updated config
     model = GPTNeoXForCausalLM.from_pretrained(model_path, config=config)
 

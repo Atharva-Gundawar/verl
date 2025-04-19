@@ -53,6 +53,7 @@ from peft import LoraConfig, TaskType, get_peft_model
 from verl.workers.sharding_manager import FSDPUlyssesShardingManager
 from verl.utils.ulysses import ulysses_pad_and_slice_inputs, gather_outpus_and_unpad
 from verl import DataProto
+from verl.utils.profiler import profile_training
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv('VERL_SFT_LOGGING_LEVEL', 'WARN'))
@@ -517,6 +518,7 @@ class FSDPSFTTrainer(object):
 
         return global_step
 
+    @profile_training
     def fit(self):
         rank = self.device_mesh.get_rank()
 
