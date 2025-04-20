@@ -28,6 +28,7 @@ class ResourceProfiler:
         self.project_name = project_name
         self.experiment_name = experiment_name
         self.wandb_run = None
+        self.current_step = 0
         
     def _get_gpu_usage(self) -> Dict[str, float]:
         """Get GPU memory usage and utilization."""
@@ -50,7 +51,6 @@ class ResourceProfiler:
     
     def _monitor_resources(self):
         """Background thread function to monitor resources."""
-        step = 0
         while self.is_running:
             try:
                 # Get current timestamp
@@ -76,19 +76,22 @@ class ResourceProfiler:
                 if self.wandb_run:
                     wandb_metrics = {
                         "timestamp": timestamp,
-                        "step": step,
+                        "step": self.current_step,
                         **gpu_usage,
                         **cpu_usage
                     }
                     self.wandb_run.log(wandb_metrics)
                 
-                step += 1
                 time.sleep(self.interval)
                 
             except Exception as e:
                 if self.wandb_run:
                     self.wandb_run.log({"error": str(e)})
                 break
+    
+    def update_step(self, step: int):
+        """Update the current step counter."""
+        self.current_step = step
     
     def start(self):
         """Start the resource monitoring."""
@@ -169,10 +172,14 @@ def profile_training(func):
             project_name=project_name,
             experiment_name=experiment_name
         )
+        # Store profiler instance on trainer
+        trainer._profiler = profiler
         try:
             profiler.start()
             result = func(*args, **kwargs)
             return result
         finally:
             profiler.stop()
+            # Clean up profiler instance
+            delattr(trainer, '_profiler')
     return wrapper 

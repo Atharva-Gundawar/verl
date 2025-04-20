@@ -549,6 +549,9 @@ class FSDPSFTTrainer(object):
                              total=self.steps_per_epoch,
                              desc=f"Epoch {epoch+1}/{self.config.trainer.total_epochs}"):
                 global_step += 1
+                # Update profiler step
+                if hasattr(self, '_profiler'):
+                    self._profiler.update_step(global_step)
                 data = TensorDict(data, batch_size=self.config.data.train_batch_size).cuda()
                 metric = self.training_step(data)
                 if rank == 0:
