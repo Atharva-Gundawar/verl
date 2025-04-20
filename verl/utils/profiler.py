@@ -2,13 +2,10 @@ import torch
 import psutil
 import time
 import threading
-import logging
 from typing import Dict, List, Optional
 import csv
 from datetime import datetime
 import wandb
-
-logger = logging.getLogger(__name__)
 
 class ResourceProfiler:
     def __init__(self, output_file: str = "resource_usage.csv", interval: float = 1.0, 
@@ -37,17 +34,17 @@ class ResourceProfiler:
         gpu_usage = {}
         if torch.cuda.is_available():
             for i in range(torch.cuda.device_count()):
-                gpu_usage[f"gpu_{i}_memory_used"] = torch.cuda.memory_allocated(i) / 1024**2  # MB
-                gpu_usage[f"gpu_{i}_memory_cached"] = torch.cuda.memory_reserved(i) / 1024**2  # MB
-                gpu_usage[f"gpu_{i}_utilization"] = torch.cuda.utilization(i)  # Percentage
+                gpu_usage[f"gpu/{i}/memory_used"] = torch.cuda.memory_allocated(i) / 1024**2  # MB
+                gpu_usage[f"gpu/{i}/memory_cached"] = torch.cuda.memory_reserved(i) / 1024**2  # MB
+                gpu_usage[f"gpu/{i}/utilization"] = torch.cuda.utilization(i)  # Percentage
         return gpu_usage
     
     def _get_cpu_usage(self) -> Dict[str, float]:
         """Get CPU usage and memory information."""
         cpu_usage = {
-            "cpu_percent": psutil.cpu_percent(),
-            "cpu_memory_used": psutil.virtual_memory().used / 1024**2,  # MB
-            "cpu_memory_percent": psutil.virtual_memory().percent,
+            "cpu/percent": psutil.cpu_percent(),
+            "cpu/memory/used": psutil.virtual_memory().used / 1024**2,  # MB
+            "cpu/memory/percent": psutil.virtual_memory().percent,
         }
         return cpu_usage
     
@@ -85,20 +82,12 @@ class ResourceProfiler:
                     }
                     self.wandb_run.log(wandb_metrics)
                 
-                # Log to console
-                logger.info(f"Resource Usage at {timestamp}:")
-                logger.info(f"CPU Usage: {cpu_usage['cpu_percent']}%")
-                logger.info(f"CPU Memory: {cpu_usage['cpu_memory_used']:.2f} MB ({cpu_usage['cpu_memory_percent']}%)")
-                if gpu_usage:
-                    for i in range(torch.cuda.device_count()):
-                        logger.info(f"GPU {i} Memory: {gpu_usage[f'gpu_{i}_memory_used']:.2f} MB")
-                        logger.info(f"GPU {i} Utilization: {gpu_usage[f'gpu_{i}_utilization']}%")
-                
                 step += 1
                 time.sleep(self.interval)
                 
             except Exception as e:
-                logger.error(f"Error in resource monitoring: {e}")
+                if self.wandb_run:
+                    self.wandb_run.log({"error": str(e)})
                 break
     
     def start(self):
@@ -125,16 +114,16 @@ class ResourceProfiler:
         if torch.cuda.is_available():
             for i in range(torch.cuda.device_count()):
                 fieldnames.extend([
-                    f"gpu_{i}_memory_used",
-                    f"gpu_{i}_memory_cached",
-                    f"gpu_{i}_utilization"
+                    f"gpu/{i}/memory_used",
+                    f"gpu/{i}/memory_cached",
+                    f"gpu/{i}/utilization"
                 ])
         
         # Add CPU fields
         fieldnames.extend([
-            "cpu_percent",
-            "cpu_memory_used",
-            "cpu_memory_percent"
+            "cpu/percent",
+            "cpu/memory/used",
+            "cpu/memory/percent"
         ])
         
         self.csv_writer = csv.DictWriter(self.csv_file, fieldnames=fieldnames)
@@ -145,8 +134,6 @@ class ResourceProfiler:
         self.thread = threading.Thread(target=self._monitor_resources)
         self.thread.daemon = True
         self.thread.start()
-        
-        logger.info("Resource profiling started")
     
     def stop(self):
         """Stop the resource monitoring."""
@@ -162,8 +149,6 @@ class ResourceProfiler:
             
         if self.wandb_run:
             self.wandb_run.finish()
-            
-        logger.info("Resource profiling stopped")
 
 def profile_training(func):
     """
