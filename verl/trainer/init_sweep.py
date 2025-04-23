@@ -10,8 +10,11 @@ def init_sweep(config_path, project_name):
 
     # Initialize sweep
     sweep_id = wandb.sweep(sweep=sweep_config, project=project_name)
-    print(f"SWEEP_ID={sweep_id}")
-
+    
+    # Get the full sweep path (entity/project/sweep_id)
+    entity = wandb.api.default_entity
+    full_sweep_path = f"{entity}/{project_name}/{sweep_id}"
+    print(f"SWEEP_ID={full_sweep_path}")
 
 if __name__ == "__main__":
     if len(sys.argv) != 3:
