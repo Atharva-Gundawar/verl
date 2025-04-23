@@ -1,4 +1,4 @@
-program: verl.trainer.fsdp_sft_trainer
+program: python -m verl.trainer.fsdp_sft_trainer
 method: bayes
 metric:
   name: val/loss
