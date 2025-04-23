@@ -13,7 +13,7 @@ command:
   - ${args}
 parameters:
   data.micro_batch_size_per_gpu:
-    values: 4
+    value: 4
   data.train_batch_size:
     values: [512, 1024, 2048]
   optim.lr:
