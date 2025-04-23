@@ -19,6 +19,7 @@ TODO(zhangchi.usc1992)
 """
 
 import os
+import time
 
 os.environ['NCCL_DEBUG'] = 'WARN'
 os.environ['TOKENIZERS_PARALLELISM'] = 'true'
@@ -549,8 +550,20 @@ class FSDPSFTTrainer(object):
                              total=self.steps_per_epoch,
                              desc=f"Epoch {epoch+1}/{self.config.trainer.total_epochs}"):
                 global_step += 1
+                # Update profiler step
+                if hasattr(self, '_profiler'):
+                    self._profiler.update_step(global_step)
+                
+                # Start timing the step
+                step_start_time = time.time()
+                
                 data = TensorDict(data, batch_size=self.config.data.train_batch_size).cuda()
                 metric = self.training_step(data)
+                
+                # Calculate step duration
+                step_duration = time.time() - step_start_time
+                metric['train/step_duration'] = step_duration
+                
                 if rank == 0:
                     tracking.log(data=metric, step=global_step)
 

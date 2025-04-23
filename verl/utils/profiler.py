@@ -28,6 +28,8 @@ class ResourceProfiler:
         self.project_name = project_name
         self.experiment_name = experiment_name
         self.wandb_run = None
+        self.current_step = 0
+        self.last_logged_step = 0
         
     def _get_gpu_usage(self) -> Dict[str, float]:
         """Get GPU memory usage and utilization."""
@@ -50,45 +52,50 @@ class ResourceProfiler:
     
     def _monitor_resources(self):
         """Background thread function to monitor resources."""
-        step = 0
         while self.is_running:
             try:
-                # Get current timestamp
-                timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                
-                # Get resource usage
-                gpu_usage = self._get_gpu_usage()
-                cpu_usage = self._get_cpu_usage()
-                
-                # Combine all metrics
-                metrics = {
-                    "timestamp": timestamp,
-                    **gpu_usage,
-                    **cpu_usage
-                }
-                
-                # Write to CSV
-                if self.csv_writer:
-                    self.csv_writer.writerow(metrics)
-                    self.csv_file.flush()
-                
-                # Log to wandb
-                if self.wandb_run:
-                    wandb_metrics = {
+                # Only log if the step has changed since last log
+                if self.current_step > self.last_logged_step:
+                    # Get current timestamp
+                    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    
+                    # Get resource usage
+                    gpu_usage = self._get_gpu_usage()
+                    cpu_usage = self._get_cpu_usage()
+                    
+                    # Combine all metrics
+                    metrics = {
                         "timestamp": timestamp,
-                        "step": step,
                         **gpu_usage,
                         **cpu_usage
                     }
-                    self.wandb_run.log(wandb_metrics)
+                    
+                    # Write to CSV
+                    if self.csv_writer:
+                        self.csv_writer.writerow(metrics)
+                        self.csv_file.flush()
+                    
+                    # Log to wandb
+                    if self.wandb_run:
+                        wandb_metrics = {
+                            "timestamp": timestamp,
+                            "step": self.current_step,
+                            **gpu_usage,
+                            **cpu_usage
+                        }
+                        self.wandb_run.log(wandb_metrics)
+                        self.last_logged_step = self.current_step
                 
-                step += 1
                 time.sleep(self.interval)
                 
             except Exception as e:
                 if self.wandb_run:
                     self.wandb_run.log({"error": str(e)})
                 break
+    
+    def update_step(self, step: int):
+        """Update the current step counter."""
+        self.current_step = step
     
     def start(self):
         """Start the resource monitoring."""
@@ -169,10 +176,14 @@ def profile_training(func):
             project_name=project_name,
             experiment_name=experiment_name
         )
+        # Store profiler instance on trainer
+        trainer._profiler = profiler
         try:
             profiler.start()
             result = func(*args, **kwargs)
             return result
         finally:
             profiler.stop()
+            # Clean up profiler instance
+            delattr(trainer, '_profiler')
     return wrapper 
