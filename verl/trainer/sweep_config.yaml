@@ -19,7 +19,7 @@ parameters:
   optim.lr:
     min: 1e-5
     max: 5e-3
-    distribution: log_uniform
+    distribution: log_uniform_values
   model.enable_gradient_checkpointing:
     value: True
   trainer.total_epochs:
