@@ -535,17 +535,17 @@ class FSDPSFTTrainer(object):
                         global_step_folder = os.path.join(working_dir, global_step_folder)
                     logger.info(f'Load from checkpoint folder: {global_step_folder}')
                     
-                    # Validate checkpoint directory exists
-                    if not os.path.exists(global_step_folder):
-                        raise FileNotFoundError(f"Checkpoint directory not found: {global_step_folder}")
-                    
-                    # Load dataloader state if exists
-                    dataloader_local_path = os.path.join(global_step_folder, 'data.pt')
-                    if os.path.exists(dataloader_local_path):
-                        dataloader_state_dict = torch.load(dataloader_local_path, weights_only=False)
-                        self.train_dataloader.load_state_dict(dataloader_state_dict)
-                    else:
-                        logger.warning(f"No dataloader state found at {dataloader_local_path}, will start from scratch")
+            # Validate checkpoint directory exists
+            if not os.path.exists(global_step_folder):
+                raise FileNotFoundError(f"Checkpoint directory not found: {global_step_folder}")
+            
+            # Load dataloader state if exists
+            dataloader_local_path = os.path.join(global_step_folder, 'data.pt')
+            if os.path.exists(dataloader_local_path):
+                dataloader_state_dict = torch.load(dataloader_local_path, weights_only=False)
+                self.train_dataloader.load_state_dict(dataloader_state_dict)
+            else:
+                logger.warning(f"No dataloader state found at {dataloader_local_path}, will start from scratch")
 
             # set global step
             global_step = int(global_step_folder.split('global_step_')[-1])
