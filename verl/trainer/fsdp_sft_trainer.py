@@ -442,82 +442,147 @@ class FSDPSFTTrainer(object):
         return loss
 
     def save_checkpoint(self, step):
-        # save checkpoint
-        from torch.distributed.fsdp import FullStateDictConfig, StateDictType
-        cfg = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
-        with FSDP.state_dict_type(self.fsdp_model, StateDictType.FULL_STATE_DICT, cfg):
-            state_dict = self.fsdp_model.state_dict()
+        """Save model checkpoint with improved management and error handling."""
+        try:
+            # save checkpoint
+            from torch.distributed.fsdp import FullStateDictConfig, StateDictType
+            cfg = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
+            with FSDP.state_dict_type(self.fsdp_model, StateDictType.FULL_STATE_DICT, cfg):
+                state_dict = self.fsdp_model.state_dict()
 
-        path = os.path.join(self.config.trainer.default_local_dir, f'global_step_{step}')
-        # save huggingface model
-        if self.device_mesh.get_rank() == 0:
-            os.makedirs(path, exist_ok=True)
-            self.model.save_pretrained(path, state_dict=state_dict)
-            self.tokenizer.save_pretrained(path)
+            path = os.path.join(self.config.trainer.default_local_dir, f'global_step_{step}')
+            # save huggingface model
+            if self.device_mesh.get_rank() == 0:
+                # Create checkpoint directory
+                os.makedirs(path, exist_ok=True)
+                
+                # Save model and tokenizer
+                self.model.save_pretrained(path, state_dict=state_dict)
+                self.tokenizer.save_pretrained(path)
+                
+                # Save optimizer state
+                optimizer_path = os.path.join(path, 'optimizer.pt')
+                torch.save(self.optimizer.state_dict(), optimizer_path)
+                
+                # Save scheduler state
+                scheduler_path = os.path.join(path, 'scheduler.pt')
+                torch.save(self.lr_scheduler.state_dict(), scheduler_path)
+                
+                # Save dataloader state
+                dataloader_local_path = os.path.join(path, "data.pt")
+                dataloader_state_dict = self.train_dataloader.state_dict()
+                torch.save(dataloader_state_dict, dataloader_local_path)
+
+                # Update latest checkpoint iteration tracker
+                local_latest_checkpointed_iteration = os.path.join(
+                    self.config.trainer.default_local_dir, "latest_checkpointed_iteration.txt"
+                )
+                with open(local_latest_checkpointed_iteration, "w") as f:
+                    f.write(str(step))
+
+                # Clean up old checkpoints if max_ckpt_to_keep is set
+                max_ckpt_to_keep = getattr(self.config.trainer, 'max_ckpt_to_keep', None)
+                if max_ckpt_to_keep is not None:
+                    checkpoint_dir = self.config.trainer.default_local_dir
+                    checkpoints = [d for d in os.listdir(checkpoint_dir) if d.startswith('global_step_')]
+                    checkpoints.sort(key=lambda x: int(x.split('_')[-1]))
+                    
+                    # Remove oldest checkpoints if we exceed max_ckpt_to_keep
+                    while len(checkpoints) > max_ckpt_to_keep:
+                        oldest_ckpt = checkpoints.pop(0)
+                        oldest_path = os.path.join(checkpoint_dir, oldest_ckpt)
+                        import shutil
+                        shutil.rmtree(oldest_path)
+
+                # Upload to HDFS if configured
+                if self.config.trainer.default_hdfs_dir:
+                    hdfs_io.makedirs(self.config.trainer.default_hdfs_dir, exist_ok=True)
+                    hdfs_io.copy(src=path, dst=self.config.trainer.default_hdfs_dir, dirs_exist_ok=True)
             
-            # Save optimizer state
-            torch.save(self.optimizer.state_dict(), os.path.join(path, 'optimizer.pt'))
+            # Ensure all ranks wait for checkpoint to complete
+            torch.distributed.barrier()
             
-            # Save scheduler state
-            torch.save(self.lr_scheduler.state_dict(), os.path.join(path, 'scheduler.pt'))
-            
-            if self.config.trainer.default_hdfs_dir:
-                hdfs_io.makedirs(self.config.trainer.default_hdfs_dir, exist_ok=True)
-                hdfs_io.copy(src=path, dst=self.config.trainer.default_hdfs_dir, dirs_exist_ok=True)
-        torch.distributed.barrier()
+        except Exception as e:
+            logger.error(f"Error saving checkpoint at step {step}: {str(e)}")
+            raise
 
     def _load_checkpoint(self):
+        """Load model checkpoint with improved error handling and validation."""
         if self.config.trainer.resume_mode == 'disable':
             return 0
 
-        # load from hdfs
-        if self.config.trainer.default_local_dir is not None:
-            checkpoint_folder = self.config.trainer.default_local_dir
-            if not os.path.isabs(checkpoint_folder):
-                working_dir = os.getcwd()
-                checkpoint_folder = os.path.join(working_dir, checkpoint_folder)
-            global_step_folder = find_latest_ckpt_path(checkpoint_folder)  # None if no latest
-
-        # find global_step_folder
-        if self.config.trainer.resume_mode == 'auto':
-            if global_step_folder is None:
-                print('Training from scratch')
-                return 0
-        else:
-            if self.config.trainer.resume_mode == "resume_path":
-                assert isinstance(self.config.trainer.resume_from_path, str), "resume ckpt must be str type"
-                assert 'global_step_' in self.config.trainer.resume_from_path, "resume ckpt must specify the global_steps"
-                global_step_folder = self.config.trainer.resume_from_path
-                if not os.path.isabs(global_step_folder):
+        try:
+            # load from hdfs
+            if self.config.trainer.default_local_dir is not None:
+                checkpoint_folder = self.config.trainer.default_local_dir
+                if not os.path.isabs(checkpoint_folder):
                     working_dir = os.getcwd()
-                    global_step_folder = os.path.join(working_dir, global_step_folder)
-        print(f'Load from checkpoint folder: {global_step_folder}')
-        # set global step
-        global_step = int(global_step_folder.split('global_step_')[-1])
+                    checkpoint_folder = os.path.join(working_dir, checkpoint_folder)
+                global_step_folder = find_latest_ckpt_path(checkpoint_folder)  # None if no latest
 
-        print(f'Setting global step to {global_step}')
-        print(f'Resuming from {global_step_folder}')
+            # find global_step_folder
+            if self.config.trainer.resume_mode == 'auto':
+                if global_step_folder is None:
+                    logger.info('Training from scratch')
+                    return 0
+            else:
+                if self.config.trainer.resume_mode == "resume_path":
+                    assert isinstance(self.config.trainer.resume_from_path, str), "resume ckpt must be str type"
+                    assert 'global_step_' in self.config.trainer.resume_from_path, "resume ckpt must specify the global_steps"
+                    global_step_folder = self.config.trainer.resume_from_path
+                    if not os.path.isabs(global_step_folder):
+                        working_dir = os.getcwd()
+                        global_step_folder = os.path.join(working_dir, global_step_folder)
+                    logger.info(f'Load from checkpoint folder: {global_step_folder}')
+                    
+                    # Validate checkpoint directory exists
+                    if not os.path.exists(global_step_folder):
+                        raise FileNotFoundError(f"Checkpoint directory not found: {global_step_folder}")
+                    
+                    # Load dataloader state if exists
+                    dataloader_local_path = os.path.join(global_step_folder, 'data.pt')
+                    if os.path.exists(dataloader_local_path):
+                        dataloader_state_dict = torch.load(dataloader_local_path, weights_only=False)
+                        self.train_dataloader.load_state_dict(dataloader_state_dict)
+                    else:
+                        logger.warning(f"No dataloader state found at {dataloader_local_path}, will start from scratch")
 
-        # Load model state dict
-        from torch.distributed.fsdp import FullStateDictConfig, StateDictType
-        cfg = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
-        with FSDP.state_dict_type(self.fsdp_model, StateDictType.FULL_STATE_DICT, cfg):
-            state_dict = torch.load(os.path.join(global_step_folder, 'pytorch_model.bin'))
-            self.fsdp_model.load_state_dict(state_dict)
+            # set global step
+            global_step = int(global_step_folder.split('global_step_')[-1])
+            logger.info(f'Setting global step to {global_step}')
+            logger.info(f'Resuming from {global_step_folder}')
 
-        # Load optimizer state if exists
-        optimizer_path = os.path.join(global_step_folder, 'optimizer.pt')
-        if os.path.exists(optimizer_path):
-            optimizer_state = torch.load(optimizer_path)
-            self.optimizer.load_state_dict(optimizer_state)
+            # Load model state dict
+            from torch.distributed.fsdp import FullStateDictConfig, StateDictType
+            cfg = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
+            with FSDP.state_dict_type(self.fsdp_model, StateDictType.FULL_STATE_DICT, cfg):
+                model_path = os.path.join(global_step_folder, 'pytorch_model.bin')
+                if not os.path.exists(model_path):
+                    raise FileNotFoundError(f"Model checkpoint not found at {model_path}")
+                state_dict = torch.load(model_path)
+                self.fsdp_model.load_state_dict(state_dict)
 
-        # Load scheduler state if exists
-        scheduler_path = os.path.join(global_step_folder, 'scheduler.pt')
-        if os.path.exists(scheduler_path):
-            scheduler_state = torch.load(scheduler_path)
-            self.lr_scheduler.load_state_dict(scheduler_state)
+            # Load optimizer state if exists
+            optimizer_path = os.path.join(global_step_folder, 'optimizer.pt')
+            if os.path.exists(optimizer_path):
+                optimizer_state = torch.load(optimizer_path)
+                self.optimizer.load_state_dict(optimizer_state)
+            else:
+                logger.warning(f"No optimizer state found at {optimizer_path}")
 
-        return global_step
+            # Load scheduler state if exists
+            scheduler_path = os.path.join(global_step_folder, 'scheduler.pt')
+            if os.path.exists(scheduler_path):
+                scheduler_state = torch.load(scheduler_path)
+                self.lr_scheduler.load_state_dict(scheduler_state)
+            else:
+                logger.warning(f"No scheduler state found at {scheduler_path}")
+
+            return global_step
+
+        except Exception as e:
+            logger.error(f"Error loading checkpoint: {str(e)}")
+            raise
 
     @profile_training
     def fit(self):
