@@ -99,6 +99,7 @@ class TrainerState(Stateful):
         self.optimizer = optimizer
         self.lr_scheduler = lr_scheduler
         self.train_sampler = train_sampler
+        self.rng_state = None
 
     def state_dict(self):
         # Get model and optimizer state dicts
@@ -113,11 +114,20 @@ class TrainerState(Stateful):
         # Get sampler state dict
         sampler_state_dict = self.train_sampler.state_dict()
         
+        # Get RNG state
+        rng_state = {
+            'cpu': torch.get_rng_state(),
+            'cuda': torch.cuda.get_rng_state(),
+            'numpy': np.random.get_state(),
+            'random': random.getstate(),
+        }
+        
         return {
             "model": model_state_dict,
             "optimizer": optimizer_state_dict,
             "lr_scheduler": lr_scheduler_state_dict,
-            "sampler": sampler_state_dict
+            "sampler": sampler_state_dict,
+            "rng": rng_state
         }
 
     def load_state_dict(self, state_dict):
@@ -136,6 +146,13 @@ class TrainerState(Stateful):
         # Set sampler state dict
         if state_dict["sampler"] is not None:
             self.train_sampler.load_state_dict(state_dict["sampler"])
+            
+        # Set RNG state
+        if state_dict["rng"] is not None:
+            torch.set_rng_state(state_dict["rng"]['cpu'])
+            torch.cuda.set_rng_state(state_dict["rng"]['cuda'])
+            np.random.set_state(state_dict["rng"]['numpy'])
+            random.setstate(state_dict["rng"]['random'])
 
 
 class FSDPSFTTrainer(object):
@@ -629,8 +646,7 @@ class FSDPSFTTrainer(object):
             
             # Prepare state dict for DCP
             state_dict = {
-                "trainer": trainer_state,
-                "rng": self.get_rng_state()
+                "trainer": trainer_state
             }
             
             # Save using DCP
@@ -710,8 +726,7 @@ class FSDPSFTTrainer(object):
             
             # Prepare state dict for loading
             state_dict = {
-                "trainer": trainer_state,
-                "rng": None
+                "trainer": trainer_state
             }
             
             # Load using DCP
@@ -719,10 +734,6 @@ class FSDPSFTTrainer(object):
                 state_dict=state_dict,
                 checkpoint_id=global_step_folder,
             )
-            
-            # Load RNG state
-            if state_dict["rng"] is not None:
-                self.load_rng_state(state_dict["rng"])
             
             # Set global step
             global_step = int(global_step_folder.split('global_step_')[-1])
