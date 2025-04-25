@@ -19,7 +19,9 @@ TODO(zhangchi.usc1992)
 """
 
 import os
+import random
 import time
+import numpy as np
 
 os.environ['NCCL_DEBUG'] = 'WARN'
 os.environ['TOKENIZERS_PARALLELISM'] = 'true'
@@ -32,6 +34,10 @@ import torch
 import torch.distributed
 from torch import nn, optim
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP, MixedPrecision, ShardingStrategy, CPUOffload
+
+import torch.distributed.checkpoint as dcp
+
+from torch.distributed.checkpoint.state_dict import get_state_dict, set_state_dict
 from tqdm import tqdm
 from transformers import AutoTokenizer, AutoModelForCausalLM, PreTrainedModel, AutoConfig
 from verl.utils.torch_functional import get_cosine_schedule_with_warmup, get_wsd_schedule_with_warmup
@@ -539,76 +545,102 @@ class FSDPSFTTrainer(object):
             }
 
         return metrics
+    
+    @staticmethod
+    def get_rng_state():
+        rng_state = {
+            'cpu': torch.get_rng_state(),
+            'cuda': torch.cuda.get_rng_state(),
+            'numpy': np.random.get_state(),
+            'random': random.getstate(),
+        }
+        return rng_state
 
+    @staticmethod
+    def load_rng_state(rng_state):
+        torch.set_rng_state(rng_state['cpu'])
+        torch.cuda.set_rng_state(rng_state['cuda'])
+        np.random.set_state(rng_state['numpy'])
+        random.setstate(rng_state['random'])
     def save_checkpoint(self, step):
-        """Save model checkpoint with improved management and error handling."""
+        """Save model checkpoint using Distributed Checkpoint (DCP)."""
         try:
-            # save checkpoint
-            from torch.distributed.fsdp import FullStateDictConfig, StateDictType
-            cfg = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
-            with FSDP.state_dict_type(self.fsdp_model, StateDictType.FULL_STATE_DICT, cfg):
-                state_dict = self.fsdp_model.state_dict()
-
             path = os.path.join(self.config.trainer.default_local_dir, f'global_step_{step}')
-            # save huggingface model
+            
+            # Create checkpoint directory
             if self.device_mesh.get_rank() == 0:
-                
-                # Save model
-                max_ckpt_to_keep = getattr(self.config.trainer, 'max_ckpt_to_keep', None)
-                self.checkpoint_manager.save_checkpoint(local_path=path, global_step=step, max_ckpt_to_keep=max_ckpt_to_keep)
-                
-                
-                # Save dataloader state
-                dataloader_local_path = os.path.join(path, "data.pt")
-                dataloader_state_dict = self.train_dataloader.state_dict()
-                torch.save(dataloader_state_dict, dataloader_local_path)
-
-                # Update latest checkpoint iteration tracker
+                os.makedirs(path, exist_ok=True)
+            
+            # Get state dictionaries
+            model_state_dict, optimizer_state_dict = get_state_dict(self.fsdp_model, self.optimizer)
+            rng_state = self.get_rng_state()
+            
+            if self.lr_scheduler is not None:
+                lr_scheduler_state_dict = self.lr_scheduler.state_dict()
+            else:
+                lr_scheduler_state_dict = None
+            
+            # Get dataloader state
+            dataloader_state_dict = self.train_dataloader.state_dict()
+            
+            # Prepare state dict for DCP
+            state_dict = {
+                "model": model_state_dict,
+                "optimizer": optimizer_state_dict,
+                "lr_scheduler": lr_scheduler_state_dict,
+                "dataloader": dataloader_state_dict,
+                "rng": rng_state
+            }
+            
+            # Save using DCP
+            dcp.save(
+                state_dict=state_dict,
+                checkpoint_id=path,
+            )
+            
+            # Update latest checkpoint iteration tracker
+            if self.device_mesh.get_rank() == 0:
                 local_latest_checkpointed_iteration = os.path.join(
                     self.config.trainer.default_local_dir, "latest_checkpointed_iteration.txt"
                 )
                 with open(local_latest_checkpointed_iteration, "w") as f:
                     f.write(str(step))
-
-                # Upload to HDFS if configured
-                if self.config.trainer.default_hdfs_dir:
-                    hdfs_io.makedirs(self.config.trainer.default_hdfs_dir, exist_ok=True)
-                    hdfs_io.copy(src=path, dst=self.config.trainer.default_hdfs_dir, dirs_exist_ok=True)
+            
+            # Upload to HDFS if configured
+            if self.config.trainer.default_hdfs_dir:
+                hdfs_io.makedirs(self.config.trainer.default_hdfs_dir, exist_ok=True)
+                hdfs_io.copy(src=path, dst=self.config.trainer.default_hdfs_dir, dirs_exist_ok=True)
             
             # Ensure all ranks wait for checkpoint to complete
             torch.distributed.barrier()
             
             # Sync to S3 if configured
             if self.config.trainer.s3_checkpoint_dir:
-                #Run an os.system command to sync the checkpoint to S3 and get result if it succeeded or failed
-
                 result = os.system(f"aws s3 sync {self.config.trainer.default_local_dir} {self.config.trainer.s3_checkpoint_dir}")
-
-                # If there are "upload:" in the output, then it succeeded
-                # Check return code instead of stdout for success
                 if result == 0:
                     logger.info(f"Checkpoint sync to S3 initiated for step {step}")
                 else:
                     logger.error(f"S3 sync command failed with exit code {result} at step {step}")
+                
         except Exception as e:
             logger.error(f"Error saving checkpoint at step {step}: {str(e)}")
             raise
 
     def _load_checkpoint(self):
-        """Load model checkpoint with improved error handling and validation."""
+        """Load model checkpoint using Distributed Checkpoint (DCP)."""
         if self.config.trainer.resume_mode == 'disable':
             return 0
 
         try:
-            # load from hdfs
+            # Find checkpoint directory
             if self.config.trainer.default_local_dir is not None:
                 checkpoint_folder = self.config.trainer.default_local_dir
                 if not os.path.isabs(checkpoint_folder):
                     working_dir = os.getcwd()
                     checkpoint_folder = os.path.join(working_dir, checkpoint_folder)
-                global_step_folder = find_latest_ckpt_path(checkpoint_folder)  # None if no latest
+                global_step_folder = find_latest_ckpt_path(checkpoint_folder)
 
-            # find global_step_folder
+            # Determine which checkpoint to load
             if self.config.trainer.resume_mode == 'auto':
                 if global_step_folder is None:
                     logger.info('Training from scratch')
@@ -622,28 +654,52 @@ class FSDPSFTTrainer(object):
                         working_dir = os.getcwd()
                         global_step_folder = os.path.join(working_dir, global_step_folder)
                     logger.info(f'Load from checkpoint folder: {global_step_folder}')
-                    
+            
             # Validate checkpoint directory exists
             if not os.path.exists(global_step_folder):
                 raise FileNotFoundError(f"Checkpoint directory not found: {global_step_folder}")
             
-            # Load dataloader state if exists
-            dataloader_local_path = os.path.join(global_step_folder, 'data.pt')
-            if os.path.exists(dataloader_local_path):
-                dataloader_state_dict = torch.load(dataloader_local_path, weights_only=False)
-                self.train_dataloader.load_state_dict(dataloader_state_dict)
+            # Prepare state dict for loading
+            state_dict = {
+                "model": None,
+                "optimizer": None,
+                "lr_scheduler": None,
+                "dataloader": None,
+                "rng": None
+            }
+            
+            # Load using DCP
+            dcp.load(
+                state_dict=state_dict,
+                checkpoint_id=global_step_folder,
+            )
+            
+            # Set state dictionaries
+            set_state_dict(self.fsdp_model, self.optimizer, 
+                          model_state_dict=state_dict["model"],
+                          optim_state_dict=state_dict["optimizer"])
+            
+            # Load dataloader state
+            if state_dict["dataloader"] is not None:
+                self.train_dataloader.load_state_dict(state_dict["dataloader"])
             else:
-                logger.warning(f"No dataloader state found at {dataloader_local_path}, will start from scratch")
-
-            # set global step
+                logger.warning("No dataloader state found, will start from scratch")
+            
+            # Load learning rate scheduler state
+            if self.lr_scheduler is not None and state_dict["lr_scheduler"] is not None:
+                self.lr_scheduler.load_state_dict(state_dict["lr_scheduler"])
+            
+            # Load RNG state
+            if state_dict["rng"] is not None:
+                self.load_rng_state(state_dict["rng"])
+            
+            # Set global step
             global_step = int(global_step_folder.split('global_step_')[-1])
             logger.info(f'Setting global step to {global_step}')
             logger.info(f'Resuming from {global_step_folder}')
-
-            self.checkpoint_manager.load_checkpoint(local_path=global_step_folder)
-
+            
             return global_step
-
+            
         except Exception as e:
             logger.error(f"Error loading checkpoint: {str(e)}")
             raise
