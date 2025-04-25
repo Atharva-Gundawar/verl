@@ -24,6 +24,7 @@ import time
 os.environ['NCCL_DEBUG'] = 'WARN'
 os.environ['TOKENIZERS_PARALLELISM'] = 'true'
 
+import boto3
 import logging
 import re
 from contextlib import nullcontext
@@ -55,6 +56,8 @@ from verl.workers.sharding_manager import FSDPUlyssesShardingManager
 from verl.utils.ulysses import ulysses_pad_and_slice_inputs, gather_outpus_and_unpad
 from verl import DataProto
 from verl.utils.profiler import profile_training
+
+from verl.third_party.trace_eval_new import evaluate_trace_response
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv('VERL_SFT_LOGGING_LEVEL', 'WARN'))
@@ -435,11 +438,100 @@ class FSDPSFTTrainer(object):
         return {'train/loss': step_loss.detach().item(), 'train/lr(1e-3)': lr * 1e3}
 
     def validation_step(self, batch: TensorDict):
+        """Calculates overall loss and evaluates plan/trace sections separately."""
         self.fsdp_model.eval()
+        metrics = {}
         with torch.no_grad():
-            loss = self._compute_loss_and_backward(batch, do_backward=False)
-            torch.distributed.all_reduce(loss, op=torch.distributed.ReduceOp.AVG)
-        return loss
+            # --- Input Preparation ---
+            input_ids = batch['input_ids'].cuda()
+            attention_mask = batch['attention_mask'].cuda()
+            position_ids = batch.get('position_ids', None)
+            if position_ids is not None:
+                position_ids = position_ids.cuda()
+
+            labels = input_ids[:, 1:].contiguous()
+            loss_mask = batch['loss_mask'][:, :-1].contiguous().cuda()
+
+            # --- Forward Pass ---
+            with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+                output = self.fsdp_model(input_ids=input_ids,
+                                         attention_mask=attention_mask,
+                                         position_ids=position_ids,
+                                         use_cache=False)
+                logits = output.logits
+
+            # --- Standard Loss Calculation ---
+            shift_logits = logits[..., :-1, :].contiguous()
+            shift_labels = labels.contiguous()
+
+            loss_fct = nn.CrossEntropyLoss(reduction='none')
+            flat_shift_logits = shift_logits.view(-1, self.model.config.vocab_size)
+            flat_shift_labels = shift_labels.view(-1)
+            flat_loss_mask = loss_mask.view(-1)
+
+            # Calculate per-token loss
+            loss_unreduced = loss_fct(flat_shift_logits, flat_shift_labels.to(flat_shift_logits.device))
+            overall_loss_masked = loss_unreduced * flat_loss_mask
+            valid_overall_tokens = torch.sum(flat_loss_mask)
+
+            # Handle token balancing if enabled
+            dp_size = 1
+            if self.config.data.balance_dp_token:
+                dp_size = self.device_mesh.size(0) if not self.ulysses_device_mesh else self.ulysses_device_mesh.size(0)
+                torch.distributed.all_reduce(valid_overall_tokens)
+
+            # Calculate average loss
+            overall_loss = torch.sum(overall_loss_masked) / (valid_overall_tokens + 1e-8) * dp_size
+            torch.distributed.all_reduce(overall_loss, op=torch.distributed.ReduceOp.AVG)
+            """
+            prompt= ['start', '1', '0', 'goal', '7', '3', 'wall', '7', '0', 'wall', '0', '1', 'wall', '2', '1', 'wall', '3', '1', 'wall', '8', '1', 'wall', '6', '2', 'wall', '0', '3', 'wall', '3', '3', 'wall', '4', '3', 'wall', '6', '3', 'wall', '0', '4', 'wall', '1', '4', 'wall', '2', '4', 'wall', '5', '4', 'wall', '0', '5', 'wall', '5', '5', 'wall', '8', '5', 'wall', '5', '6', 'wall', '6', '6', 'wall', '1', '7', 'wall', '2', '7', 'wall', '5', '7', 'wall', '7', '7', 'wall', '8', '7', 'wall', '4', '8', 'wall', '6', '8', 'wall', '7', '8', 'wall', '8', '8', 'wall', '0', '9', 'wall', '2', '9', 'wall', '4', '9', 'wall', '5', '9']
+            response=['create', '1', '0', 'c0', 'c9', 'close', '1', '0', 'c0', 'c9', 'create', '2', '0', 'c1', 'c8', 'create', '0', '0', 'c1', 'c10', 'create', '1', '1', 'c1', 'c8', 'close', '2', '0', 'c1', 'c8', 'create', '3', '0', 'c2', 'c7', 'close', '1', '1', 'c1', 'c8', 'create', '1', '2', 'c2', 'c7', 'close', '1', '2', 'c2', 'c7', 'create', '1', '3', 'c3', 'c6', 'create', '2', '2', 'c3', 'c6', 'create', '0', '2', 'c3', 'c8', 'close', '2', '2', 'c3', 'c6', 'create', '2', '3', 'c4', 'c5', 'create', '3', '2', 'c4', 'c5', 'close', '3', '2', 'c4', 'c5', 'create', '4', '2', 'c5', 'c4', 'close', '4', '2', 'c5', 'c4', 'create', '5', '2', 'c6', 'c3', 'create', '4', '1', 'c6', 'c5', 'close', '3', '0', 'c2', 'c7', 'create', '4', '0', 'c3', 'c6', 'close', '5', '2', 'c6', 'c3', 'create', '5', '3', 'c7', 'c2', 'create', '5', '1', 'c7', 'c4', 'close', '2', '3', 'c4', 'c5', 'close', '1', '3', 'c3', 'c6', 'close', '5', '3', 'c7', 'c2', 'close', '4', '0', 'c3', 'c6', 'create', '5', '0', 'c4', 'c5', 'create', '4', '1', 'c4', 'c5', 'close', '5', '0', 'c4', 'c5', 'create', '6', '0', 'c5', 'c4', 'create', '5', '1', 'c5', 'c4', 'close', '4', '1', 'c4', 'c5', 'create', '5', '1', 'c5', 'c4', 'close', '5', '1', 'c5', 'c4', 'create', '6', '1', 'c6', 'c3', 'close', '6', '0', 'c5', 'c4', 'close', '6', '1', 'c6', 'c3', 'create', '7', '1', 'c7', 'c2', 'close', '5', '1', 'c5', 'c4', 'close', '7', '1', 'c7', 'c2', 'create', '7', '2', 'c8', 'c1', 'close', '7', '2', 'c8', 'c1', 'create', '8', '2', 'c9', 'c2', 'create', '7', '3', 'c9', 'c0', 'close', '7', '3', 'c9', 'c0', 'plan', '1', '0', 'plan', '2', '0', 'plan', '3', '0', 'plan', '4', '0', 'plan', '4', '1', 'plan', '5', '1', 'plan', '6', '1', 'plan', '7', '1', 'plan', '7', '2', 'plan', '7', '3']
+            labels = prompt+response
+            """
+            # --- Plan/Trace Evaluation ---
+            # Decode model outputs and labels to text
+            outputs_text = self.tokenizer.batch_decode(output.logits.argmax(dim=-1), skip_special_tokens=True)
+            labels_text = self.tokenizer.batch_decode(labels, skip_special_tokens=True)
+            # Get prompt and response from labels_text 
+            
+                    
+
+            # Initialize evaluation metrics
+            plan_metrics = {'accuracy': 0.0}
+            trace_metrics = {'accuracy': 0.0}
+            total_samples = len(outputs_text)
+
+            # Evaluate each sample
+            for output_text, label_text in zip(outputs_text, labels_text):
+                prompt = []
+                p_end = False
+                for i in range(len(label_text)):
+                    if label_text[i] == 'create':
+                        p_end = True
+                    if not p_end:
+                        prompt.append(label_text[i])
+                    
+                
+                trace_is_valid, llm_plan_is_valid, errors, llm_plan_errors = evaluate_trace_response([i.strip() for i in output_text.split(' ')], prompt, [], True)
+
+                if trace_is_valid:
+                    trace_metrics['accuracy'] += 1
+                if llm_plan_is_valid:
+                    plan_metrics['accuracy'] += 1
+
+            # Average the metrics
+            if total_samples > 0:
+                plan_metrics['accuracy'] /= total_samples
+                trace_metrics['accuracy'] /= total_samples
+
+            # Combine all metrics
+            metrics = {
+                'val/loss': overall_loss.item(),
+                'val/plan_accuracy': plan_metrics['accuracy'],
+                'val/trace_accuracy': trace_metrics['accuracy']
+            }
+
+        return metrics
 
     def save_checkpoint(self, step):
         """Save model checkpoint with improved management and error handling."""
@@ -502,6 +594,18 @@ class FSDPSFTTrainer(object):
             # Ensure all ranks wait for checkpoint to complete
             torch.distributed.barrier()
             
+            # Sync to S3 if configured
+            if self.config.trainer.s3_checkpoint_dir:
+                #Run an os.system command to sync the checkpoint to S3 and get result if it succeeded or failed
+
+                result = os.system(f"aws s3 sync {self.config.trainer.default_local_dir} {self.config.trainer.s3_checkpoint_dir}")
+
+                # If there are "upload:" in the output, then it succeeded
+                # Check return code instead of stdout for success
+                if result == 0:
+                    logger.info(f"Checkpoint sync to S3 initiated for step {step}")
+                else:
+                    logger.error(f"S3 sync command failed with exit code {result} at step {step}")
         except Exception as e:
             logger.error(f"Error saving checkpoint at step {step}: {str(e)}")
             raise
@@ -639,15 +743,17 @@ class FSDPSFTTrainer(object):
                 # for early exit validation
                 if global_step >= self.total_training_steps:
                     # Perform final validation
-                    val_losses = []
+                    val_metrics_list = []
                     for val_data in self.val_dataloader:
                         val_data = TensorDict(val_data, batch_size=self.config.data.micro_batch_size_per_gpu).cuda()
-                        val_loss = self.validation_step(val_data)
-                        val_losses.append(val_loss)
+                        val_metrics = self.validation_step(val_data)
+                        val_metrics_list.append(val_metrics)
                     if rank == 0:
-                        avg_val_loss = torch.mean(torch.stack(val_losses))
-                        metric = {'val/loss': avg_val_loss.detach().item()}
-                        tracking.log(data=metric, step=global_step)
+                        # Average metrics across validation batches
+                        avg_val_metrics = {}
+                        for key in val_metrics_list[0].keys():
+                            avg_val_metrics[key] = torch.mean(torch.tensor([m[key] for m in val_metrics_list])).item()
+                        tracking.log(data=avg_val_metrics, step=global_step)
                     torch.distributed.barrier()
 
                     # Save final checkpoint
@@ -655,15 +761,20 @@ class FSDPSFTTrainer(object):
                     return
 
             # validation
-            val_losses = []
+            val_metrics_list = []
             for data in self.val_dataloader:
                 data = TensorDict(data, batch_size=self.config.data.micro_batch_size_per_gpu).cuda()
-                val_loss = self.validation_step(data)
-                val_losses.append(val_loss)
+                val_metrics = self.validation_step(data)
+                val_metrics_list.append(val_metrics)
             if rank == 0:
-                val_loss = torch.mean(torch.stack(val_losses))
-                metric = {'val/loss': val_loss.detach().item()}
-                tracking.log(data=metric, step=global_step)
+                # Average metrics across validation batches
+                avg_val_metrics = {}
+                if val_metrics_list:
+                    for key in val_metrics_list[0].keys():
+                        avg_val_metrics[key] = torch.mean(torch.tensor([m[key] for m in val_metrics_list])).item()
+                    tracking.log(data=avg_val_metrics, step=global_step)
+                else:
+                    logger.warning("Validation dataloader was empty, skipping validation logging.")
             torch.distributed.barrier()
 
             # save checkpoint at end of epoch if save_freq is not set or if it's not a multiple of save_freq
