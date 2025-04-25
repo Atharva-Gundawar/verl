@@ -36,6 +36,7 @@ from torch import nn, optim
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP, MixedPrecision, ShardingStrategy, CPUOffload
 
 import torch.distributed.checkpoint as dcp
+from torch.distributed.checkpoint.stateful import Stateful
 
 from torch.distributed.checkpoint.state_dict import get_state_dict, set_state_dict
 from tqdm import tqdm
