@@ -56,4 +56,5 @@ trainer:
   logger: ['console']
   seed: 1
   s3_checkpoint_dir: null
+  maze_size: 30
 
