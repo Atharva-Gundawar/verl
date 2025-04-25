@@ -38,6 +38,7 @@ from verl.utils.torch_functional import get_cosine_schedule_with_warmup, get_wsd
 from tensordict import TensorDict
 from torch.utils.data import DataLoader, DistributedSampler
 from flash_attn.bert_padding import pad_input, unpad_input, rearrange, index_first_axis
+from verl.utils.checkpoint.fsdp_checkpoint_manager import FSDPCheckpointManager
 
 from verl.utils.fsdp_utils import get_fsdp_wrap_policy, init_fn, get_init_weight_context_manager
 from verl.utils.dataset import SFTDataset
@@ -300,6 +301,11 @@ class FSDPSFTTrainer(object):
                                                              num_training_steps=self.total_steps)
         else:
             raise ValueError(f'Unknown lr scheduler: {self.config.optim.lr_scheduler}')
+        
+        self.checkpoint_manager = FSDPCheckpointManager(model=self.fsdp_model,
+                                                        optimizer=self.optimizer,
+                                                        lr_scheduler=self.lr_scheduler,
+                                                        tokenizer=self.tokenizer)
 
     def _compute_loss_and_backward(self, batch, do_backward=True):
         """Compute loss with optional sequence parallelism and remove padding features"""
@@ -546,20 +552,11 @@ class FSDPSFTTrainer(object):
             path = os.path.join(self.config.trainer.default_local_dir, f'global_step_{step}')
             # save huggingface model
             if self.device_mesh.get_rank() == 0:
-                # Create checkpoint directory
-                os.makedirs(path, exist_ok=True)
                 
-                # Save model and tokenizer
-                self.model.save_pretrained(path, state_dict=state_dict)
-                self.tokenizer.save_pretrained(path)
+                # Save model
+                max_ckpt_to_keep = getattr(self.config.trainer, 'max_ckpt_to_keep', None)
+                self.checkpoint_manager.save_checkpoint(local_path=path, global_step=step, max_ckpt_to_keep=max_ckpt_to_keep)
                 
-                # Save optimizer state
-                optimizer_path = os.path.join(path, 'optimizer.pt')
-                torch.save(self.optimizer.state_dict(), optimizer_path)
-                
-                # Save scheduler state
-                scheduler_path = os.path.join(path, 'scheduler.pt')
-                torch.save(self.lr_scheduler.state_dict(), scheduler_path)
                 
                 # Save dataloader state
                 dataloader_local_path = os.path.join(path, "data.pt")
@@ -572,20 +569,6 @@ class FSDPSFTTrainer(object):
                 )
                 with open(local_latest_checkpointed_iteration, "w") as f:
                     f.write(str(step))
-
-                # Clean up old checkpoints if max_ckpt_to_keep is set
-                max_ckpt_to_keep = getattr(self.config.trainer, 'max_ckpt_to_keep', None)
-                if max_ckpt_to_keep is not None:
-                    checkpoint_dir = self.config.trainer.default_local_dir
-                    checkpoints = [d for d in os.listdir(checkpoint_dir) if d.startswith('global_step_')]
-                    checkpoints.sort(key=lambda x: int(x.split('_')[-1]))
-                    
-                    # Remove oldest checkpoints if we exceed max_ckpt_to_keep
-                    while len(checkpoints) > max_ckpt_to_keep:
-                        oldest_ckpt = checkpoints.pop(0)
-                        oldest_path = os.path.join(checkpoint_dir, oldest_ckpt)
-                        import shutil
-                        shutil.rmtree(oldest_path)
 
                 # Upload to HDFS if configured
                 if self.config.trainer.default_hdfs_dir:
@@ -657,31 +640,7 @@ class FSDPSFTTrainer(object):
             logger.info(f'Setting global step to {global_step}')
             logger.info(f'Resuming from {global_step_folder}')
 
-            # Load model state dict
-            from torch.distributed.fsdp import FullStateDictConfig, StateDictType
-            cfg = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
-            with FSDP.state_dict_type(self.fsdp_model, StateDictType.FULL_STATE_DICT, cfg):
-                model_path = os.path.join(global_step_folder, 'pytorch_model.bin')
-                if not os.path.exists(model_path):
-                    raise FileNotFoundError(f"Model checkpoint not found at {model_path}")
-                state_dict = torch.load(model_path)
-                self.fsdp_model.load_state_dict(state_dict)
-
-            # Load optimizer state if exists
-            optimizer_path = os.path.join(global_step_folder, 'optimizer.pt')
-            if os.path.exists(optimizer_path):
-                optimizer_state = torch.load(optimizer_path)
-                self.optimizer.load_state_dict(optimizer_state)
-            else:
-                logger.warning(f"No optimizer state found at {optimizer_path}")
-
-            # Load scheduler state if exists
-            scheduler_path = os.path.join(global_step_folder, 'scheduler.pt')
-            if os.path.exists(scheduler_path):
-                scheduler_state = torch.load(scheduler_path)
-                self.lr_scheduler.load_state_dict(scheduler_state)
-            else:
-                logger.warning(f"No scheduler state found at {scheduler_path}")
+            self.checkpoint_manager.load_checkpoint(local_path=global_step_folder)
 
             return global_step
 
