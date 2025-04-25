@@ -90,16 +90,79 @@ def convert_to_regular_types(obj):
         return {k: convert_to_regular_types(v) for k, v in obj.items()}
     return obj
 
+# Taken from https://github.com/facebookresearch/vissl/blob/09270ed25a6c2cf71263d955b64cbe076d34ac45/vissl/data/data_helper.py#L93
+class StatefulDistributedSampler(DistributedSampler):
+    """
+    More fine-grained state DataSampler that uses training iteration and epoch
+    both for shuffling data. PyTorch DistributedSampler only uses epoch
+    for the shuffling and starts sampling data from the start. In case of training
+    on very large data, we train for one epoch only and when we resume training,
+    we want to resume the data sampler from the training iteration.
+    """
+
+    def __init__(self, dataset, batch_size=None, seed: int = 0):
+        """
+        Initializes the instance of StatefulDistributedSampler. Random seed is set
+        for the epoch set and data is shuffled. For starting the sampling, use
+        the start_iter (set to 0 or set by checkpointing resuming) to
+        sample data from the remaining images.
+
+        Args:
+            dataset (Dataset): Pytorch dataset that sampler will shuffle
+            batch_size (int): batch size we want the sampler to sample
+            seed (int): Seed for the torch generator.
+        """
+        super().__init__(dataset, shuffle=False, seed=seed)
+
+        self.start_iter = 0
+        self.batch_size = batch_size
+        self.total_size = len(dataset) - (len(dataset) % self.num_replicas)
+        self.num_samples = self.total_size // self.num_replicas
+        logging.info(f"rank: {self.rank}: Sampler created...")
+
+    def __iter__(self):
+        # partition data into num_replicas and optionally shuffle within a rank
+        g = torch.Generator()
+        g.manual_seed(self.epoch + self.seed)
+        shuffling = torch.randperm(self.num_samples, generator=g).tolist()
+        indices = np.array(
+            list(
+                range(
+                    (self.rank * self.num_samples), (self.rank + 1) * self.num_samples
+                )
+            )
+        )[shuffling].tolist()
+
+        # make sure we have correct number of samples per replica
+        assert len(indices) == self.num_samples
+        assert self.batch_size > 0, "batch_size not set for the sampler"
+
+        # resume the sampler
+        start_index = self.start_iter * self.batch_size
+        indices = indices[start_index:]
+        return iter(indices)
+
+    def set_start_iter(self, start_iter):
+        """
+        Set the iteration number from which the sampling should start. This is
+        used to find the marker in the data permutation order from where the
+        sampler should start sampling.
+        """
+        self.start_iter = start_iter
+
 
 class TrainerState(Stateful):
     """A wrapper for checkpointing the trainer state. This object is compliant with the Stateful protocol,
     so DCP will automatically call state_dict/load_state_dict as needed in the dcp.save/load APIs.
     """
-    def __init__(self, model, optimizer, lr_scheduler, train_sampler):
+    def __init__(self, model, optimizer, lr_scheduler, train_sampler, train_dataloader, val_sampler, val_dataloader):
         self.model = model
         self.optimizer = optimizer
         self.lr_scheduler = lr_scheduler
         self.train_sampler = train_sampler
+        self.train_dataloader = train_dataloader
+        self.val_sampler = val_sampler
+        self.val_dataloader = val_dataloader
         self.rng_state = None
 
     def state_dict(self):
@@ -112,8 +175,16 @@ class TrainerState(Stateful):
         else:
             lr_scheduler_state_dict = None
             
-        # Get sampler state dict
-        sampler_state_dict = self.train_sampler.state_dict()
+        # Get sampler state dicts
+        train_sampler_state_dict = {
+            'epoch': self.train_sampler.epoch,
+            'start_iter': self.train_sampler.start_iter,
+            'seed': self.train_sampler.seed
+        }
+        
+        
+        # Get dataloader state dicts
+        train_dataloader_state_dict = self.train_dataloader.state_dict()
         
         # Get RNG state
         rng_state = {
@@ -127,7 +198,8 @@ class TrainerState(Stateful):
             "model": model_state_dict,
             "optimizer": optimizer_state_dict,
             "lr_scheduler": lr_scheduler_state_dict,
-            "sampler": sampler_state_dict,
+            "train_sampler": train_sampler_state_dict,
+            "train_dataloader": train_dataloader_state_dict,
             "rng": rng_state
         }
 
@@ -144,9 +216,16 @@ class TrainerState(Stateful):
         if self.lr_scheduler is not None and state_dict["lr_scheduler"] is not None:
             self.lr_scheduler.load_state_dict(state_dict["lr_scheduler"])
             
-        # Set sampler state dict
-        if state_dict["sampler"] is not None:
-            self.train_sampler.load_state_dict(state_dict["sampler"])
+        # Set sampler state dicts
+        if state_dict["train_sampler"] is not None:
+            self.train_sampler.epoch = state_dict["train_sampler"]["epoch"]
+            self.train_sampler.set_start_iter(state_dict["train_sampler"]["start_iter"])
+            self.train_sampler.seed = state_dict["train_sampler"]["seed"]
+  
+        # Set dataloader state dicts
+        if state_dict["train_dataloader"] is not None:
+            self.train_dataloader.load_state_dict(state_dict["train_dataloader"])
+
             
         # Set RNG state
         if state_dict["rng"] is not None:
@@ -238,29 +317,31 @@ class FSDPSFTTrainer(object):
         if self.device_mesh.get_rank() == 0:
             print(f'Using FSDP rank {rank} and size {world_size} for data distribution')
 
-        self.train_sampler = DistributedSampler(self.train_dataset,
+        self.train_sampler = StatefulDistributedSampler(dataset=self.train_dataset,
+            batch_size=config.data.train_batch_size,
+            seed=config.trainer.seed if hasattr(config.trainer, 'seed') else 0,
                                                 shuffle=True,
                                                 num_replicas=world_size,
                                                 rank=rank,
                                                 drop_last=True)
-        self.train_dataloader = DataLoader(dataset=self.train_dataset,
+        self.train_dataloader = StatefulDataLoader(dataset=self.train_dataset,
                                            batch_size=config.data.train_batch_size,
                                            sampler=self.train_sampler,
                                            num_workers=8,
                                            collate_fn=collate_fn,
                                            drop_last=True)
 
-        self.val_sampler = DistributedSampler(self.val_dataset,
-                                              shuffle=False,
-                                              num_replicas=world_size,
-                                              rank=rank,
-                                              drop_last=True)
-        self.val_dataloader = DataLoader(dataset=self.val_dataset,
-                                         batch_size=config.data.micro_batch_size_per_gpu,
-                                         sampler=self.val_sampler,
-                                         num_workers=8,
-                                         pin_memory=True,
-                                         drop_last=True)
+        self.val_sampler = DistributedSampler(
+            self.val_dataset, shuffle=False, num_replicas=world_size, rank=rank, drop_last=True
+        )
+        self.val_dataloader = DataLoader(
+            dataset=self.val_dataset,
+            batch_size=config.data.micro_batch_size_per_gpu,
+            sampler=self.val_sampler,
+            num_workers=8,
+            pin_memory=True,
+            drop_last=True,
+        )
 
     def _build_model_optimizer(self):
         # TODO (zhangchi.usc1992):
@@ -642,7 +723,8 @@ class FSDPSFTTrainer(object):
                 model=self.fsdp_model,
                 optimizer=self.optimizer,
                 lr_scheduler=self.lr_scheduler,
-                train_sampler=self.train_sampler
+                train_sampler=self.train_sampler,
+                train_dataloader=self.train_dataloader
             )
             
             # Prepare state dict for DCP
@@ -722,7 +804,8 @@ class FSDPSFTTrainer(object):
                 model=self.fsdp_model,
                 optimizer=self.optimizer,
                 lr_scheduler=self.lr_scheduler,
-                train_sampler=self.train_sampler
+                train_sampler=self.train_sampler,
+                train_dataloader=self.train_dataloader,
             )
             
             # Prepare state dict for loading
