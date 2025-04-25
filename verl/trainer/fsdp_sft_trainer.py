@@ -155,14 +155,12 @@ class TrainerState(Stateful):
     """A wrapper for checkpointing the trainer state. This object is compliant with the Stateful protocol,
     so DCP will automatically call state_dict/load_state_dict as needed in the dcp.save/load APIs.
     """
-    def __init__(self, model, optimizer, lr_scheduler, train_sampler, train_dataloader, val_sampler, val_dataloader):
+    def __init__(self, model, optimizer, lr_scheduler, train_sampler, train_dataloader):
         self.model = model
         self.optimizer = optimizer
         self.lr_scheduler = lr_scheduler
         self.train_sampler = train_sampler
         self.train_dataloader = train_dataloader
-        self.val_sampler = val_sampler
-        self.val_dataloader = val_dataloader
         self.rng_state = None
 
     def state_dict(self):
@@ -175,15 +173,14 @@ class TrainerState(Stateful):
         else:
             lr_scheduler_state_dict = None
             
-        # Get sampler state dicts
+        # Get sampler state dict
         train_sampler_state_dict = {
             'epoch': self.train_sampler.epoch,
             'start_iter': self.train_sampler.start_iter,
             'seed': self.train_sampler.seed
         }
         
-        
-        # Get dataloader state dicts
+        # Get dataloader state dict
         train_dataloader_state_dict = self.train_dataloader.state_dict()
         
         # Get RNG state
@@ -216,16 +213,15 @@ class TrainerState(Stateful):
         if self.lr_scheduler is not None and state_dict["lr_scheduler"] is not None:
             self.lr_scheduler.load_state_dict(state_dict["lr_scheduler"])
             
-        # Set sampler state dicts
+        # Set sampler state dict
         if state_dict["train_sampler"] is not None:
             self.train_sampler.epoch = state_dict["train_sampler"]["epoch"]
             self.train_sampler.set_start_iter(state_dict["train_sampler"]["start_iter"])
             self.train_sampler.seed = state_dict["train_sampler"]["seed"]
-  
-        # Set dataloader state dicts
+            
+        # Set dataloader state dict
         if state_dict["train_dataloader"] is not None:
             self.train_dataloader.load_state_dict(state_dict["train_dataloader"])
-
             
         # Set RNG state
         if state_dict["rng"] is not None:
@@ -802,7 +798,7 @@ class FSDPSFTTrainer(object):
                 optimizer=self.optimizer,
                 lr_scheduler=self.lr_scheduler,
                 train_sampler=self.train_sampler,
-                train_dataloader=self.train_dataloader,
+                train_dataloader=self.train_dataloader
             )
             
             # Prepare state dict for loading
