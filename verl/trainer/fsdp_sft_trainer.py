@@ -177,7 +177,7 @@ class FSDPSFTTrainer(object):
                                                 num_replicas=world_size,
                                                 rank=rank,
                                                 drop_last=True)
-        self.train_dataloader = StatefulDataLoader(dataset=self.train_dataset,
+        self.train_dataloader = DataLoader(dataset=self.train_dataset,
                                            batch_size=config.data.train_batch_size,
                                            sampler=self.train_sampler,
                                            num_workers=8,
@@ -189,7 +189,7 @@ class FSDPSFTTrainer(object):
                                               num_replicas=world_size,
                                               rank=rank,
                                               drop_last=True)
-        self.val_dataloader = StatefulDataLoader(dataset=self.val_dataset,
+        self.val_dataloader = DataLoader(dataset=self.val_dataset,
                                          batch_size=config.data.micro_batch_size_per_gpu,
                                          sampler=self.val_sampler,
                                          num_workers=8,
@@ -580,15 +580,15 @@ class FSDPSFTTrainer(object):
             else:
                 lr_scheduler_state_dict = None
             
-            # Get dataloader state
-            dataloader_state_dict = self.train_dataloader.state_dict()
+            # Get sampler state instead of dataloader state
+            sampler_state_dict = self.train_sampler.state_dict()
             
             # Prepare state dict for DCP
             state_dict = {
                 "model": model_state_dict,
                 "optimizer": optimizer_state_dict,
                 "lr_scheduler": lr_scheduler_state_dict,
-                "dataloader": dataloader_state_dict,
+                "sampler": sampler_state_dict,
                 "rng": rng_state
             }
             
@@ -664,7 +664,7 @@ class FSDPSFTTrainer(object):
                 "model": None,
                 "optimizer": None,
                 "lr_scheduler": None,
-                "dataloader": None,
+                "sampler": None,
                 "rng": None
             }
             
@@ -679,11 +679,11 @@ class FSDPSFTTrainer(object):
                           model_state_dict=state_dict["model"],
                           optim_state_dict=state_dict["optimizer"])
             
-            # Load dataloader state
-            if state_dict["dataloader"] is not None:
-                self.train_dataloader.load_state_dict(state_dict["dataloader"])
+            # Load sampler state
+            if state_dict["sampler"] is not None:
+                self.train_sampler.load_state_dict(state_dict["sampler"])
             else:
-                logger.warning("No dataloader state found, will start from scratch")
+                logger.warning("No sampler state found, will start from scratch")
             
             # Load learning rate scheduler state
             if self.lr_scheduler is not None and state_dict["lr_scheduler"] is not None:
