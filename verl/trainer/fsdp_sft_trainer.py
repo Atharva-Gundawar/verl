@@ -90,6 +90,54 @@ def convert_to_regular_types(obj):
     return obj
 
 
+class TrainerState(Stateful):
+    """A wrapper for checkpointing the trainer state. This object is compliant with the Stateful protocol,
+    so DCP will automatically call state_dict/load_state_dict as needed in the dcp.save/load APIs.
+    """
+    def __init__(self, model, optimizer, lr_scheduler, train_sampler):
+        self.model = model
+        self.optimizer = optimizer
+        self.lr_scheduler = lr_scheduler
+        self.train_sampler = train_sampler
+
+    def state_dict(self):
+        # Get model and optimizer state dicts
+        model_state_dict, optimizer_state_dict = get_state_dict(self.model, self.optimizer)
+        
+        # Get lr scheduler state dict if exists
+        if self.lr_scheduler is not None:
+            lr_scheduler_state_dict = self.lr_scheduler.state_dict()
+        else:
+            lr_scheduler_state_dict = None
+            
+        # Get sampler state dict
+        sampler_state_dict = self.train_sampler.state_dict()
+        
+        return {
+            "model": model_state_dict,
+            "optimizer": optimizer_state_dict,
+            "lr_scheduler": lr_scheduler_state_dict,
+            "sampler": sampler_state_dict
+        }
+
+    def load_state_dict(self, state_dict):
+        # Set model and optimizer state dicts
+        set_state_dict(
+            self.model,
+            self.optimizer,
+            model_state_dict=state_dict["model"],
+            optim_state_dict=state_dict["optimizer"]
+        )
+        
+        # Set lr scheduler state dict if exists
+        if self.lr_scheduler is not None and state_dict["lr_scheduler"] is not None:
+            self.lr_scheduler.load_state_dict(state_dict["lr_scheduler"])
+            
+        # Set sampler state dict
+        if state_dict["sampler"] is not None:
+            self.train_sampler.load_state_dict(state_dict["sampler"])
+
+
 class FSDPSFTTrainer(object):
 
     def __init__(self, config, device_mesh: DeviceMesh, ulysses_device_mesh: DeviceMesh):
@@ -571,25 +619,18 @@ class FSDPSFTTrainer(object):
             if self.device_mesh.get_rank() == 0:
                 os.makedirs(path, exist_ok=True)
             
-            # Get state dictionaries
-            model_state_dict, optimizer_state_dict = get_state_dict(self.fsdp_model, self.optimizer)
-            rng_state = self.get_rng_state()
-            
-            if self.lr_scheduler is not None:
-                lr_scheduler_state_dict = self.lr_scheduler.state_dict()
-            else:
-                lr_scheduler_state_dict = None
-            
-            # Get sampler state instead of dataloader state
-            sampler_state_dict = self.train_sampler.state_dict()
+            # Create trainer state
+            trainer_state = TrainerState(
+                model=self.fsdp_model,
+                optimizer=self.optimizer,
+                lr_scheduler=self.lr_scheduler,
+                train_sampler=self.train_sampler
+            )
             
             # Prepare state dict for DCP
             state_dict = {
-                "model": model_state_dict,
-                "optimizer": optimizer_state_dict,
-                "lr_scheduler": lr_scheduler_state_dict,
-                "sampler": sampler_state_dict,
-                "rng": rng_state
+                "trainer": trainer_state,
+                "rng": self.get_rng_state()
             }
             
             # Save using DCP
@@ -659,12 +700,17 @@ class FSDPSFTTrainer(object):
             if not os.path.exists(global_step_folder):
                 raise FileNotFoundError(f"Checkpoint directory not found: {global_step_folder}")
             
+            # Create trainer state
+            trainer_state = TrainerState(
+                model=self.fsdp_model,
+                optimizer=self.optimizer,
+                lr_scheduler=self.lr_scheduler,
+                train_sampler=self.train_sampler
+            )
+            
             # Prepare state dict for loading
             state_dict = {
-                "model": None,
-                "optimizer": None,
-                "lr_scheduler": None,
-                "sampler": None,
+                "trainer": trainer_state,
                 "rng": None
             }
             
@@ -673,21 +719,6 @@ class FSDPSFTTrainer(object):
                 state_dict=state_dict,
                 checkpoint_id=global_step_folder,
             )
-            
-            # Set state dictionaries
-            set_state_dict(self.fsdp_model, self.optimizer, 
-                          model_state_dict=state_dict["model"],
-                          optim_state_dict=state_dict["optimizer"])
-            
-            # Load sampler state
-            if state_dict["sampler"] is not None:
-                self.train_sampler.load_state_dict(state_dict["sampler"])
-            else:
-                logger.warning("No sampler state found, will start from scratch")
-            
-            # Load learning rate scheduler state
-            if self.lr_scheduler is not None and state_dict["lr_scheduler"] is not None:
-                self.lr_scheduler.load_state_dict(state_dict["lr_scheduler"])
             
             # Load RNG state
             if state_dict["rng"] is not None:
