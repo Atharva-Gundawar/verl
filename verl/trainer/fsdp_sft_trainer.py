@@ -320,10 +320,7 @@ class FSDPSFTTrainer(object):
         self.train_sampler = StatefulDistributedSampler(dataset=self.train_dataset,
             batch_size=config.data.train_batch_size,
             seed=config.trainer.seed if hasattr(config.trainer, 'seed') else 0,
-                                                shuffle=True,
-                                                num_replicas=world_size,
-                                                rank=rank,
-                                                drop_last=True)
+                                                )
         self.train_dataloader = StatefulDataLoader(dataset=self.train_dataset,
                                            batch_size=config.data.train_batch_size,
                                            sampler=self.train_sampler,
