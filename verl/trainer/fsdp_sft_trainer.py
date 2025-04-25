@@ -58,7 +58,8 @@ from verl import DataProto
 from verl.utils.profiler import profile_training
 
 from verl.third_party.trace_eval_new import evaluate_trace_response
-
+from torchdata.stateful_dataloader import StatefulDataLoader
+from verl.utils.dataset.sft_dataset import collate_fn
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv('VERL_SFT_LOGGING_LEVEL', 'WARN'))
 
@@ -169,11 +170,11 @@ class FSDPSFTTrainer(object):
                                                 num_replicas=world_size,
                                                 rank=rank,
                                                 drop_last=True)
-        self.train_dataloader = DataLoader(dataset=self.train_dataset,
+        self.train_dataloader = StatefulDataLoader(dataset=self.train_dataset,
                                            batch_size=config.data.train_batch_size,
                                            sampler=self.train_sampler,
                                            num_workers=8,
-                                           pin_memory=True,
+                                           collate_fn=collate_fn,
                                            drop_last=True)
 
         self.val_sampler = DistributedSampler(self.val_dataset,
@@ -181,7 +182,7 @@ class FSDPSFTTrainer(object):
                                               num_replicas=world_size,
                                               rank=rank,
                                               drop_last=True)
-        self.val_dataloader = DataLoader(dataset=self.val_dataset,
+        self.val_dataloader = StatefulDataLoader(dataset=self.val_dataset,
                                          batch_size=config.data.micro_batch_size_per_gpu,
                                          sampler=self.val_sampler,
                                          num_workers=8,

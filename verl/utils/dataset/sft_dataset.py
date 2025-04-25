@@ -18,7 +18,9 @@ SFT dataset
 Each parquet file contains
 """
 
+from collections import defaultdict
 from typing import List, Union
+import numpy as np
 
 import pandas as pd
 
@@ -30,6 +32,24 @@ from verl.utils.fs import copy_to_local
 from verl.utils.model import compute_position_id_with_mask
 from verl.utils import hf_tokenizer
 
+def collate_fn(data_list: list[dict]) -> dict:
+    tensors = defaultdict(list)
+    non_tensors = defaultdict(list)
+
+    for data in data_list:
+        for key, val in data.items():
+            if isinstance(val, torch.Tensor):
+                tensors[key].append(val)
+            else:
+                non_tensors[key].append(val)
+
+    for key, val in tensors.items():
+        tensors[key] = torch.stack(val, dim=0)
+
+    for key, val in non_tensors.items():
+        non_tensors[key] = np.array(val, dtype=object)
+
+    return {**tensors, **non_tensors}
 
 class SFTDataset(Dataset):
     """
