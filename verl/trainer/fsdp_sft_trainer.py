@@ -663,9 +663,10 @@ class FSDPSFTTrainer(object):
                         p_end = True
                     if not p_end:
                         prompt.append(label_text[i])
-                    
-                print(prompt, output_text)
-                trace_is_valid, llm_plan_is_valid, errors, llm_plan_errors = evaluate_trace_response([i.strip() for i in output_text.split(' ')], prompt, [self.config.trainer.maze_size, self.config.trainer.maze_size], None, False)
+                #Convert list to string
+                output = ''.join(output_text)
+                print(prompt, output)
+                trace_is_valid, llm_plan_is_valid, errors, llm_plan_errors = evaluate_trace_response([i.strip() for i in output.split(' ')], prompt, [self.config.trainer.maze_size, self.config.trainer.maze_size], None, False)
 
                 if trace_is_valid:
                     trace_metrics['accuracy'] += 1
