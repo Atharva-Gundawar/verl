@@ -1,5 +1,4 @@
 import json
-from rich import print
 from copy import deepcopy
 from tqdm import tqdm
 import boto3
