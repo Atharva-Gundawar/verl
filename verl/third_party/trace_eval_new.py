@@ -119,8 +119,12 @@ def parse_prompt_maze(prompt: list[str], DEBUG: bool = False, maze_size: tuple[i
     maze = [[0 for _ in range(maze_size[0])] for _ in range(maze_size[1])]
     for wall in walls:
         maze[wall[0]][wall[1]] = 1
-    maze[start[0]][start[1]] = 2
-    maze[goal[0]][goal[1]] = 3
+    try:
+        maze[start[0]][start[1]] = 2
+        maze[goal[0]][goal[1]] = 3
+    except: 
+        print(prompt)
+        raise Exception(f"Invalid start or goal: {start}, {goal}")
     if DEBUG:
         print(maze)
     return start, goal, walls, maze

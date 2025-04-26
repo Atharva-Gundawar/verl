@@ -34,7 +34,7 @@ import torch
 import torch.distributed
 from torch import nn, optim
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP, MixedPrecision, ShardingStrategy, CPUOffload
-
+from rich import print
 import torch.distributed.checkpoint as dcp
 from torch.distributed.checkpoint.stateful import Stateful
 
@@ -664,7 +664,7 @@ class FSDPSFTTrainer(object):
                     if not p_end:
                         prompt.append(label_text[i])
                     
-                
+                print(prompt, [i.strip() for i in output_text.split(' ')])
                 trace_is_valid, llm_plan_is_valid, errors, llm_plan_errors = evaluate_trace_response([i.strip() for i in output_text.split(' ')], prompt, [self.config.trainer.maze_size, self.config.trainer.maze_size], None, False)
 
                 if trace_is_valid:
