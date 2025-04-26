@@ -656,12 +656,16 @@ class FSDPSFTTrainer(object):
             # Evaluate each sample
             for output_text, label_text in zip(outputs_text, labels_text):
                 prompt = []
+                p_start = False
                 p_end = False
                 for i in range(len(label_text)):
-                    if label_text[i] == 'create':
+                    if label_text[i] == 'start':
+                        p_start = True
+                    if 'Assistant' in label_text[i]:
                         p_end = True
-                    if not p_end:
+                    if p_start and not p_end:
                         prompt.append(label_text[i])
+                    
                 #Convert list to string
                 output = ''.join(output_text)
                 prompt = ''.join(prompt)
