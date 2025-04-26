@@ -666,7 +666,9 @@ class FSDPSFTTrainer(object):
                 output = ''.join(output_text)
                 prompt = ''.join(prompt)
                 print(prompt)
+                print("\n\nEND OF PROMPT", type(prompt), '\n\n')
                 print(output)
+                print("\n\nEND OF OUTPUT", type(output), '\n\n')
                 trace_is_valid, llm_plan_is_valid, errors, llm_plan_errors = evaluate_trace_response([i.strip() for i in output.split(' ')], prompt, [self.config.trainer.maze_size, self.config.trainer.maze_size], None, False)
 
                 if trace_is_valid:
