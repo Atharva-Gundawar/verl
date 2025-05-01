@@ -118,8 +118,8 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     create_custom_tokenizer(
-        width=args.width,
-        height=args.height,
+        width=args.maze_width,
+        height=args.maze_height,
         output_save_dir=args.output_save_dir,
         model_path=args.model_path,
         context_window=args.context_window,
